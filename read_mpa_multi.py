@@ -1,7 +1,17 @@
 # coding: utf-8
 # python pp.py build_ext --inplace
 # This is a code to read multiple RT dumps and plot them for the midplane
-# approximation. This is the version that fills the missing items with the previous values.
+# approximation. This is the version that interpolates the missing dumps
+#
+# LOGS
+#
+# 28 May 2025
+# Adding functionality to handle source_proj (tilt not taken into account)
+#
+# 24 June 2025 cleaned up functions that are now called from plot_multi_funcs
+#
+
+
 
 import os, sys, gc
 import platform
@@ -15,11 +25,9 @@ import matplotlib.pyplot as plt
 
 import read_mpa_funcs as rmf
 
-PI=3.1415926536
-
-rtdrange=[180,300] #range of dumps to read
+rtdrange=[180,2990] #range of dumps to read
 n_filesi=rtdrange[1]-rtdrange[0]+1
-n_files=n_filesi
+n_files=0
 dirname = "/data3/atakans/T65TOR_RT/RT3"
 
 dump=rtdrange[0]
@@ -32,16 +40,19 @@ if os.path.exists(dirname + "/rt%d" % dump):
 
     N1=rmf.N1
     N3=rmf.N3
-
-    times=np.zeros((n_files), dtype=np.float32)
+    dumps=np.zeros((n_filesi), dtype=np.uint16)
+    times=np.zeros((n_filesi), dtype=np.float32)
     radius_read_all=np.zeros((N1,N3), dtype=np.float32)
     h_phi_read_all=np.zeros((N1,N3), dtype=np.float32)
     phi_read_all=np.zeros((N1,N3), dtype=np.float32)
-    rho_proj_read_all=np.zeros((n_files,N1,N3), dtype=np.float32)
-    rho_scale_all=np.zeros((n_files,N1,N3), dtype=np.float32)
-    Temp_all=np.zeros((n_files,N1,N3), dtype=np.float32)
-    Mdotv2_all=np.zeros((n_files,N1,N3), dtype=np.float32)
-
+    rho_proj_read_all=np.zeros((n_filesi,N1,N3), dtype=np.float32)
+    rho_scale_all=np.zeros((n_filesi,N1,N3), dtype=np.float32)
+    Temp_all=np.zeros((n_filesi,N1,N3), dtype=np.float32)
+    Mdotv2_all=np.zeros((n_filesi,N1,N3), dtype=np.float32)
+    dUscaled_all=np.zeros((n_filesi,N1,N3), dtype=np.float32)
+    
+    n_files=n_files+1
+    dumps[0]=dump
     radius_read_all=rmf.radius_read
     h_phi_read_all=rmf.h_phi_read
     phi_read_all=rmf.phi_read
@@ -49,13 +60,17 @@ if os.path.exists(dirname + "/rt%d" % dump):
     rho_scale_all[0,:,:]=rmf.rho_scale
     Temp_all[0,:,:]=rmf.Temp
     times[0]=rmf.t_read[0,0]
-    Mdotv2_all[0,:,:]=2.*PI*rmf.rho_proj_read[:,:]*rmf.uukerr_proj_read[1,:,:]*rmf.radius_read[:,:]
+    Mdotv2_all[0,:,:]=2.*np.pi*rmf.rho_proj_read[:,:]*rmf.uukerr_proj_read[1,:,:]*rmf.radius_read[:,:]
+    #Energy density
+    dU_scaled = rmf.source_proj_read * rmf.rho_scale * rmf.C_CGS ** 2 * (rmf.length_scale) / rmf.time_scale  # erg/cm^2/s
+    dUscaled_all[0,:,:]=dU_scaled[:,:]
+    
     
 else:
     print("First Dump %d must exist, exiting" % dump)
     sys.exit(1)
 
-for i in range(n_files-1):
+for i in range(n_filesi-1):
     dump=rtdrange[0]+1+i
     print("Reading dump %d" % dump)
     if os.path.exists(dirname + "/rt%d" % dump):
@@ -63,11 +78,15 @@ for i in range(n_files-1):
         #calc_kmetr()  I do not need this for now
         rmf.calc_aux_disk()
         print(rmf.t_read[0,0])
+        n_files=n_files+1
+        dumps[i+1]=dump
         times[i+1]=rmf.t_read[0,0]
         rho_proj_read_all[i+1,:,:]=rmf.rho_proj_read
         rho_scale_all[i+1,:,:]=rmf.rho_scale
         Temp_all[i+1,:,:]=rmf.Temp
-        Mdotv2_all[i+1,:,:]=2.*PI*rmf.rho_proj_read[:,:]*rmf.uukerr_proj_read[1,:,:]*rmf.radius_read[:,:]
+        Mdotv2_all[i+1,:,:]=2.*np.pi*rmf.rho_proj_read[:,:]*rmf.uukerr_proj_read[1,:,:]*rmf.radius_read[:,:]
+        dU_scaled = rmf.source_proj_read * rmf.rho_scale * rmf.C_CGS ** 2 * (rmf.length_scale) / rmf.time_scale  # erg/cm^2/s
+        dUscaled_all[i+1,:,:]=dU_scaled[:,:]
     else:
         print("Dump %d does not exist, skipping" % dump)
 #        times[i+1]=times[i]+50. #Check this later
@@ -82,139 +101,19 @@ rho_proj_read_all=rho_proj_read_all[times>0.,:,:]
 rho_scale_all=rho_scale_all[times>0.,:,:]
 Temp_all=Temp_all[times>0.,:,:]
 Mdotv2_all=Mdotv2_all[times>0.,:,:]
+dumps=dumps[times>0.]
+dUscaled_all=dUscaled_all[times>0.,:,:]
 times=times[times>0.]
 
-def enable_backend():
-    """Set an interactive backend if running in IPython terminal."""
-    try:
-        from IPython import get_ipython
-        ipy = get_ipython()
-        if ipy is not None:
-            if 'terminal' in str(type(ipy)).lower():
-                import matplotlib
-                matplotlib.use('MacOSX')
-    except Exception as e:
-        print(f"Could not set backend: {e}")
-
-
-def prep_plot_multi(var, r,
-               rbin=1.0, rmin=None, rmax=None):
-    """
-    Prepare data for plotting by calculating the average of var in bins defined by r.
-    
-    Parameters:
-        var : 3D array of variable values
-        r   : 2D array of radius values
-        
-    Returns:
-        var_avgr : 1D array of average variable values in each bin
-    """
-    # Flatten the arrays to 1D, possibly not useful
-    r = r.flatten()
-    #var = var.flatten()
-
-    # Remove NaN values from var and corresponding r values (later...)
-    #mask = ~np.isnan(var)
-    #r = r[mask]
-    #var = var[mask]
-
-
-    if rmin is None:
-        rmin=np.min(r)
-    if rmax is None:
-        rmax=np.max(r)  #going to large r may be problematic
-
-    #get number of bins
-    nbins=var.shape[0]
-    var_avgr=np.zeros((nbins), dtype=np.float32)
-
-    for i in range(nbins):
-        vari=var[i,:,:].flatten()
-        var_avgr[i]=vari[(r>=rmin) & (r<rmax)].mean()
-
-    return var_avgr
-
-
-def interpolate_times(times, var):
-    """
-    Interpolates the variable var to match the 50rg/c times.
-    
-    Parameters:
-        times : 1D array of time values
-        var   : 1D array of variable values
-        
-    Returns:
-        var_interp : 1D array of interpolated variable values
-        times_interp : 1D array of interpolated time values
-    """
-    # Find the time range
-    tmin = times.min() - (times.min() % 50.)
-    tmax = times.max() + (50. - (times.max() % 50.))
-    times_interp = np.arange(tmin, tmax+1, 50)
-
-    interp_func = interp1d(times, var, kind='linear', fill_value='extrapolate')
-    var_interp = interp_func(times_interp)
-    return times_interp, var_interp
-
-
-def plot_variables(x, y, expng=False, filename='plot.png', 
-                   x_scale='linear', y_scale='linear',
-                   x_label='X_axis', y_label='Y_axis',
-                   x_range=None, y_range=None, 
-                   title='My Plot'):
-    """
-    Plots y vs x with options for axis scaling, labels, and ranges.
-
-    Parameters:
-        x, y        : Arrays or lists of data points
-        x_scale     : 'linear' or 'log'
-        y_scale     : 'linear' or 'log'
-        x_label     : Label for x-axis
-        y_label     : Label for y-axis
-        x_range     : Tuple (xmin, xmax) or None
-        y_range     : Tuple (ymin, ymax) or None
-        title       : Title of the plot
-    """
-#    enable_backend()
-
-
-    if (platform.system() == 'Darwin'):
-        enable_backend()
-
-    plt.figure(figsize=(8, 6))
-    plt.plot(x, y)  #marker='o'
-
-    plt.xscale(x_scale)
-    plt.yscale(y_scale)
-
-    plt.xlabel(x_label)
-    plt.ylabel(y_label)
-    plt.title(title)
-
-    if x_range:
-        plt.xlim(x_range)
-    if y_range:
-        plt.ylim(y_range)
-
-    plt.grid(False)
-
-    if expng:
-        plt.savefig(filename, dpi=300, bbox_inches='tight')
-        print(f"Plot saved to {filename}")
-    else:
-#        enable_backend()
-        plt.show()
-
-    plt.close()  # close figure to avoid memory issues in loops
-    
-    plt.show()
-
-
-
+'''
 #ymdot=prep_plot_multi(Mdot_phi_read_all, radius_read_all, rmin=0., rmax=10.)
-ymdot=prep_plot_multi(Mdotv2_all, radius_read_all, rmin=0., rmax=10.)
+ymdot=prep_plot_multi(Mdotv2_all, radius_read_all, rmin=6.5, rmax=100.)
 
 ntimes, nymdot=interpolate_times(times, ymdot)
+
+
+dbbpow=prep_plot_multi_oa(dUscaled_all, radius_read_all, rmin=6.5, rmax=100.)
+ntimes, ndbbpow = interpolate_times(times, dbbpow)
 
 tmin=ntimes.min()-5.
 tmax=ntimes.max()+5.
@@ -230,9 +129,26 @@ elif nymdot.min() <= 0. :
     ymin=nymdot.min()*1.2
 
 
-plot_variables(ntimes, nymdot, expng=True, filename='dene.png',
+plot_variables(ntimes, nymdot, expng=True, filename='Mdot_180_2990_r6.5_r100.png',
                    x_scale='linear', y_scale='linear',
                    x_label='Time (Rg/c)', y_label='Mdot (g/s ?)',
                    x_range=[tmin,tmax], y_range=[ymin,ymax], 
                    title='Mdot vs Time')
 
+if ndbbpow.max() > 0. :
+    ymax=ndbbpow.max()*1.2
+elif ndbbpow.max() <= 0. :
+    ymax=ndbbpow.max()*0.8
+
+if ndbbpow.min() > 0. :
+    ymin=ndbbpow.min()*0.8
+elif ndbbpow.min() <= 0. :
+    ymin=ndbbpow.min()*1.2
+
+
+plot_variables(ntimes, ndbbpow, expng=True, filename='dbbpowr180_2870_6.5_100.png',
+                   x_scale='linear', y_scale='linear',
+                   x_label='Time (Rg/c)', y_label='P (ergs/s)',
+                   x_range=[tmin,tmax], y_range=[ymin,ymax], 
+                   title='BB power vs Time')
+'''
